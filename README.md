@@ -35,8 +35,9 @@ Resume Upload → Preferences → Company Discovery → Job Discovery → Matchi
 | Backend | Python 3.10, FastAPI, Uvicorn, SQLAlchemy + SQLite |
 | Agent Framework | **CrewAI** — every structured LLM call runs as a real `Agent` + `Task` inside a `Crew`, with `output_pydantic` enforcing the response shape |
 | Resume Parsing | pypdf, python-docx |
-| LLM (chat) | Swappable via one env var: Google Gemini, OpenRouter, OpenAI, or local Ollama — routed through CrewAI's own provider layer (native for Gemini/OpenAI, LiteLLM-backed for OpenRouter/Ollama) |
+| LLM (chat) | Configurable primary provider (Google Gemini, OpenRouter, OpenAI, or local Ollama) with an optional two-tier fallback chain — e.g. OpenRouter → Gemini → local Ollama — so a rate-limited or unavailable provider automatically falls through to the next rather than failing the request; routed through CrewAI's own provider layer (native for Gemini/OpenAI, LiteLLM-backed for OpenRouter/Ollama) |
 | LLM (embeddings) | Google Gemini `gemini-embedding-001`, always used for semantic matching regardless of the chat provider |
+| Prompt-Injection Guard | [NVIDIA NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails) (self-check-input rail, local Ollama model), applied only to scraped career-page text before it reaches the extraction LLM — the one place in this app where LLM input comes from a source the user doesn't control |
 | Web Search | Tavily Search API |
 | Additional Job Source | Apify (LinkedIn actor), optional and opt-in |
 | Browser Automation | Playwright (Chromium) |
@@ -87,7 +88,7 @@ frontend/
 
 - Python 3.10+
 - Node.js 18+
-- (Optional) [Ollama](https://ollama.com) if running a local LLM instead of a cloud provider
+- (Optional) [Ollama](https://ollama.com) if running a local LLM as your primary/fallback provider, or to use the prompt-injection guard (see below)
 
 ### 1. Backend setup
 
@@ -107,7 +108,9 @@ copy .env.example .env        # then fill in your own API keys
 
 ### 2. Configure `backend/.env`
 
-Set `LLM_PROVIDER` to one of `openai` / `ollama` / `gemini` / `openrouter` and fill in the matching API key. A Tavily key is required for company/job discovery. A Gemini key is required for semantic matching specifically (used independently of whichever chat provider you choose). Apify is optional (adds LinkedIn listings). See `backend/.env.example` for the full list — never commit real values.
+Set `LLM_PROVIDER` to one of `openai` / `ollama` / `gemini` / `openrouter` and fill in the matching API key. Optionally set `LLM_FALLBACK_PROVIDER` (and `LLM_FALLBACK_PROVIDER_2`) to a different provider — if the primary fails (bad/missing key, rate limit exhausted, request error), the app automatically retries against the fallback chain in order before giving up. A Tavily key is required for company/job discovery. A Gemini key is required for semantic matching specifically (used independently of whichever chat provider you choose). Apify is optional (adds LinkedIn listings). See `backend/.env.example` for the full list — never commit real values.
+
+The prompt-injection guard on scraped career-page text (`backend/app/guardrails/`) uses a local Ollama model regardless of which LLM_PROVIDER you configure, so `ollama serve` needs to be running with that model pulled for it to actually run — see `backend/app/guardrails/config.yml` for which model. It fails open (allows content through unchecked) if Ollama isn't reachable, so this is a hardening layer, not a hard requirement to run the app.
 
 ### 3. Frontend setup
 
@@ -130,6 +133,7 @@ This starts the backend (`uvicorn app.main:app --port 8000`) and frontend (`vite
 - Some sites (e.g. TCS, EPAM, Naukri) actively block automated browser access; those sources are either excluded or shipped with a documented caveat rather than a fake result.
 - Job Discovery renders companies concurrently (bounded, via Playwright's async API against one shared browser) — an earlier attempt using Playwright's sync API from a thread pool caused a real 30+ minute hang, since that API isn't thread-safe; the async rewrite avoids that. LLM extraction calls stay capped to a small concurrency (tied to how many Gemini API keys are configured — one key can be round-robined with a second `GEMINI_API_KEY_2` to roughly double the rate-limit budget), since that shared rate limit, not the browser, is the real bottleneck. A full run against ~25 companies still takes a few minutes.
 - Semantic matching requires a Gemini API key specifically; it's unavailable if only a non-Gemini provider is configured, with a documented, non-silent fallback to a 5-factor score.
+- The prompt-injection guard fails open: if the local Ollama check itself errors (e.g. Ollama isn't running), scraped page content is passed to the extraction LLM unchecked rather than blocking Job Discovery outright. It's a hardening layer, not a guarantee.
 - Single-user, local application — no authentication/multi-user support, no production deployment configuration.
 - Does not select jobs, prepare applications, open any real application page, or interact with a form field in any way — the project intentionally ends at the matched-jobs results screen. Applying for a job is entirely up to the user, outside this app, using the job/application links shown on each result.
 
