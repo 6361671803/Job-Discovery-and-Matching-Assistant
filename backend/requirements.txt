@@ -19,3 +19,4 @@ python-dotenv==1.2.2
 numpy==1.26.4
 scikit-learn==1.5.2
 crewai[google-genai]==1.15.17
+nemoguardrails==0.24.1

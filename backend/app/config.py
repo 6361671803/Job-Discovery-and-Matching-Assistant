@@ -10,6 +10,15 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     ollama_base_url: str = "http://localhost:11434/v1"
 
+    # Optional fallback chain tried in order when the primary (llm_provider/llm_model) fails —
+    # e.g. LLM_PROVIDER=openrouter, LLM_FALLBACK_PROVIDER=gemini, LLM_FALLBACK_PROVIDER_2=ollama
+    # (a local model as the last resort, since it has no rate limit but is slower/less capable).
+    # Leave unset to keep the previous single-provider behavior (a failure just raises).
+    llm_fallback_provider: str | None = None
+    llm_fallback_model: str | None = None
+    llm_fallback_provider_2: str | None = None
+    llm_fallback_model_2: str | None = None
+
     gemini_api_key: str | None = None
     # Optional second Gemini key (e.g. a free-tier key from a different Google account), used to
     # roughly double the effective rate-limit budget by round-robining LLM calls between the two

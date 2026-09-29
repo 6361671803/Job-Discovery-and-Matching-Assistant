@@ -56,36 +56,35 @@ class LLMRequestError(RuntimeError):
     pass
 
 
-def _build_llm():
+def _build_llm(provider: str, model: str):
     from crewai import LLM
 
-    provider = settings.llm_provider
     if provider == "openai":
         if not settings.openai_api_key:
             raise LLMNotConfiguredError(
                 "OPENAI_API_KEY is not set. Add it to backend/.env (see backend/.env.example)."
             )
-        return LLM(model=f"openai/{settings.llm_model}", api_key=settings.openai_api_key)
+        return LLM(model=f"openai/{model}", api_key=settings.openai_api_key)
 
     if provider == "gemini":
         if not settings.gemini_api_key:
             raise LLMNotConfiguredError(
                 "GEMINI_API_KEY is not set. Add it to backend/.env (see backend/.env.example)."
             )
-        return LLM(model=f"gemini/{settings.llm_model}", api_key=_next_gemini_key())
+        return LLM(model=f"gemini/{model}", api_key=_next_gemini_key())
 
     if provider == "openrouter":
         if not settings.openrouter_api_key:
             raise LLMNotConfiguredError(
                 "OPENROUTER_API_KEY is not set. Add it to backend/.env (see backend/.env.example)."
             )
-        return LLM(model=f"openrouter/{settings.llm_model}", api_key=settings.openrouter_api_key)
+        return LLM(model=f"openrouter/{model}", api_key=settings.openrouter_api_key)
 
     if provider == "ollama":
         # Local CPU inference on a large structured-output schema can be slow, same reasoning as
         # the original _chat_json's generous Ollama timeout.
         return LLM(
-            model=f"ollama/{settings.llm_model}",
+            model=f"ollama/{model}",
             base_url=settings.ollama_base_url.removesuffix("/v1"),
             timeout=600,
         )
@@ -102,21 +101,21 @@ def _retry_delay_seconds(error: Exception, attempt: int) -> float:
     return 2.0 * attempt
 
 
-def run_structured_task(
+def _run_with_llm(
+    llm,
     role: str,
     goal: str,
     backstory: str,
     task_description: str,
     expected_output: str,
     output_model: Type[T],
-    inputs: dict | None = None,
+    inputs: dict | None,
 ) -> T:
     """Runs one CrewAI Agent + one Task in a single-task sequential Crew, and returns the
     schema-validated Pydantic output. Retries on rate-limit errors the same way the original
     _chat_json did (up to 3 attempts, honoring a provider's own suggested retry delay)."""
     from crewai import Agent, Crew, Process, Task
 
-    llm = _build_llm()
     agent = Agent(role=role, goal=goal, backstory=backstory, llm=llm, verbose=False)
     task = Task(
         description=task_description,
@@ -135,8 +134,14 @@ def run_structured_task(
             # per provider; rate-limit errors are identified by message content (same approach
             # the original _chat_json used for the provider's own "retry in Ns" hint), since a
             # single shared exception class across every provider/backend isn't guaranteed here.
-            is_rate_limit = "rate" in str(e).lower() and "limit" in str(e).lower()
-            if not is_rate_limit:
+            error_text = str(e).lower()
+            is_rate_limit = "rate" in error_text and "limit" in error_text
+            # Free-tier models also fail transiently under load without using "rate limit"
+            # wording — Gemini's "503 UNAVAILABLE ... currently experiencing high demand" is
+            # the one that showed up live; treat it the same as a rate limit (short backoff,
+            # same retry budget) rather than failing the whole request on a temporary blip.
+            is_overloaded = "503" in error_text or "unavailable" in error_text or "high demand" in error_text or "overloaded" in error_text
+            if not (is_rate_limit or is_overloaded):
                 raise LLMRequestError(f"LLM request failed: {e}") from e
             attempt += 1
             if attempt > MAX_RATE_LIMIT_RETRIES:
@@ -149,3 +154,40 @@ def run_structured_task(
             f"LLM response did not match the required schema ({output_model.__name__}): {result.raw[:500]}"
         )
     return result.pydantic
+
+
+def _fallback_chain() -> list[tuple[str, str]]:
+    """(provider, model) tuples to try in order: primary, then each configured fallback tier
+    that's actually set."""
+    chain = [(settings.llm_provider, settings.llm_model)]
+    if settings.llm_fallback_provider:
+        chain.append((settings.llm_fallback_provider, settings.llm_fallback_model or settings.llm_model))
+    if settings.llm_fallback_provider_2:
+        chain.append((settings.llm_fallback_provider_2, settings.llm_fallback_model_2 or settings.llm_model))
+    return chain
+
+
+def run_structured_task(
+    role: str,
+    goal: str,
+    backstory: str,
+    task_description: str,
+    expected_output: str,
+    output_model: Type[T],
+    inputs: dict | None = None,
+) -> T:
+    """Tries each provider in the configured chain (primary, then LLM_FALLBACK_PROVIDER, then
+    LLM_FALLBACK_PROVIDER_2) in order, moving to the next only when one fails outright — bad/
+    missing key, rate limit exhausted, request error. Raises the last tier's error if every
+    tier fails."""
+    chain = _fallback_chain()
+    for i, (provider, model) in enumerate(chain):
+        try:
+            llm = _build_llm(provider, model)
+            return _run_with_llm(llm, role, goal, backstory, task_description, expected_output, output_model, inputs)
+        except (LLMNotConfiguredError, LLMRequestError) as error:
+            is_last = i == len(chain) - 1
+            if is_last:
+                raise
+            next_provider = chain[i + 1][0]
+            logger.warning("LLM provider '%s' failed (%s); falling back to '%s'", provider, error, next_provider)

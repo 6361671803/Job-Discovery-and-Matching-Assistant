@@ -22,6 +22,7 @@ from app.services.apify_client import fetch_apify_jobs
 from app.services.ats_detector import find_secondary_listing_link
 from app.services.browser_client import BrowserFetchError, fetch_rendered_page_async
 from app.services.date_utils import parse_posted_date
+from app.services.guardrails_client import is_scraped_content_safe
 from app.services.llm_client import (
     LLMRequestError,
     extract_job_description,
@@ -279,6 +280,10 @@ class JobDiscoveryAgent:
             except BrowserFetchError:
                 break
 
+            if not await is_scraped_content_safe(page["text"]):
+                logger.warning("Skipping %s: careers page flagged by guardrails", company.name)
+                break
+
             try:
                 async with llm_semaphore:
                     listings = await asyncio.to_thread(
@@ -308,6 +313,9 @@ class JobDiscoveryAgent:
         try:
             async with render_semaphore:
                 detail_page = await fetch_rendered_page_async(browser, job_url)
+            if not await is_scraped_content_safe(detail_page["text"]):
+                logger.warning("Skipping detail page for %r: flagged by guardrails", listing["title"])
+                return {}
             async with llm_semaphore:
                 return await asyncio.to_thread(
                     extract_job_description, listing["title"], detail_page["text"]
