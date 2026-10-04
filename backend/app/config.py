@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
+    # Paid, pay-per-token — not a free tier. Unlike openrouter/gemini, there's no ":free" model
+    # suffix or daily request cap here; every call costs real money per Anthropic's published
+    # per-token pricing.
+    anthropic_api_key: str | None = None
+
     tavily_api_key: str | None = None
 
     # Apify (optional) — adds LinkedIn Jobs as an additional job source alongside the

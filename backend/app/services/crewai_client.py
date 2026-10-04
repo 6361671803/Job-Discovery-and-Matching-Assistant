@@ -78,7 +78,23 @@ def _build_llm(provider: str, model: str):
             raise LLMNotConfiguredError(
                 "OPENROUTER_API_KEY is not set. Add it to backend/.env (see backend/.env.example)."
             )
-        return LLM(model=f"openrouter/{model}", api_key=settings.openrouter_api_key)
+        # reasoning_effort="none" — measured live: without this, qwen/qwen3.8-27b:free (a
+        # "thinking" model) spent 10,016 hidden reasoning tokens on one real extraction call,
+        # taking 3+ minutes. With it, the same kind of call dropped to 117 reasoning tokens and
+        # 5.5s. Every extraction task here just needs a schema-constrained JSON answer, not
+        # visible chain-of-thought, so there's no accuracy reason to pay for the extra reasoning.
+        return LLM(model=f"openrouter/{model}", api_key=settings.openrouter_api_key, reasoning_effort="none")
+
+    if provider == "anthropic":
+        if not settings.anthropic_api_key:
+            raise LLMNotConfiguredError(
+                "ANTHROPIC_API_KEY is not set. Add it to backend/.env (see backend/.env.example)."
+            )
+        # "anthropic/" prefix confirmed live against crewai/llm.py's own ANTHROPIC_PREFIXES check.
+        # Unlike the other providers above, every call here is paid, pay-per-token — no ":free"
+        # suffix, no daily request cap. Picking a model is a real cost decision, not just a
+        # capability one; see backend/.env.example for current per-model pricing.
+        return LLM(model=f"anthropic/{model}", api_key=settings.anthropic_api_key)
 
     if provider == "ollama":
         # Local CPU inference on a large structured-output schema can be slow, same reasoning as
