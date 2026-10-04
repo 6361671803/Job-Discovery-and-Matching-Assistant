@@ -277,7 +277,8 @@ class JobDiscoveryAgent:
             try:
                 async with render_semaphore:
                     page = await fetch_rendered_page_async(browser, url)
-            except BrowserFetchError:
+            except BrowserFetchError as e:
+                logger.warning("Skipping %s: %s", company.name, e)
                 break
 
             if not await is_scraped_content_safe(page["text"]):
@@ -289,7 +290,8 @@ class JobDiscoveryAgent:
                     listings = await asyncio.to_thread(
                         extract_job_listings, company.name, page["text"], page["links"]
                     )
-            except LLMRequestError:
+            except LLMRequestError as e:
+                logger.warning("Skipping %s: %s", company.name, e)
                 break
 
             got_confirmed_result = True
@@ -320,5 +322,6 @@ class JobDiscoveryAgent:
                 return await asyncio.to_thread(
                     extract_job_description, listing["title"], detail_page["text"]
                 )
-        except (BrowserFetchError, LLMRequestError):
+        except (BrowserFetchError, LLMRequestError) as e:
+            logger.warning("Skipping detail page for %r: %s", listing["title"], e)
             return {}

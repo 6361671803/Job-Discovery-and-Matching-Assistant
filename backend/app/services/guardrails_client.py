@@ -9,6 +9,7 @@ Uses NVIDIA NeMo Guardrails' built-in "self check input" rail (app/guardrails/),
 local Ollama model rather than the OpenRouter/Gemini cloud tiers, so this check never competes
 with the app's already rate-limited free-tier extraction calls for quota.
 """
+import asyncio
 import logging
 from pathlib import Path
 
@@ -24,6 +25,13 @@ _CONFIG_DIR = Path(__file__).resolve().parent.parent / "guardrails"
 _REFUSAL_MARKER = "can't respond to that"
 
 _rails: LLMRails | None = None
+
+# Job Discovery renders several companies' pages concurrently and would otherwise fire a
+# guardrails check for each at the same time — but they all hit the SAME local Ollama process.
+# Measured live: with no limit here, concurrent checks queued on Ollama and one single check
+# took minutes instead of seconds, stalling the whole run. Capped at 1 so checks run one at a
+# time against Ollama instead of piling up and contending for the same CPU-bound model.
+_ollama_gate = asyncio.Semaphore(1)
 
 
 def _get_rails() -> LLMRails:
@@ -44,7 +52,8 @@ async def is_scraped_content_safe(text: str) -> bool:
         return True
     try:
         rails = _get_rails()
-        response = await rails.generate_async(messages=[{"role": "user", "content": text}])
+        async with _ollama_gate:
+            response = await rails.generate_async(messages=[{"role": "user", "content": text}])
         content = response.get("content", "") if isinstance(response, dict) else str(response)
         blocked = _REFUSAL_MARKER in content.lower()
         if blocked:
