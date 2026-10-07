@@ -8,12 +8,15 @@ system prompt's exact wording — including every "never invent" rule — is pre
 each CrewAI Agent's backstory. Every deterministic grounding/anti-hallucination backstop that ran
 after the old raw LLM call runs identically here, unchanged, after the new CrewAI call.
 """
+import logging
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from app.models.schemas import CandidateProfile
 from app.services.crewai_client import LLMNotConfiguredError, LLMRequestError, run_structured_task
+
+logger = logging.getLogger("llm_client")
 
 __all__ = [
     "LLMNotConfiguredError",
@@ -32,40 +35,72 @@ __all__ = [
 # 1. Resume -> structured candidate profile
 # ============================================================================
 
-_EXTRACTION_BACKSTORY = """STRICT RULES:
-- Only use information explicitly present in the resume text.
-- Never invent, infer, or embellish skills, experience, education, or dates.
-- If a field is not present in the resume, use null (or an empty list for list fields).
-- Do not upgrade qualifiers (e.g. if the resume says "Python", do not output "Advanced Python").
-- Education: include ONLY degree entries that literally appear under an education/qualifications
-  heading in the resume. Do not add a second degree, a higher/further degree, or any degree that
-  is not explicitly written in the text — even if the candidate's skills suggest one.
-- Never expand an abbreviation or acronym (e.g. "RAG", "MCP", "NLP", "API") into a full phrase
-  unless that exact expansion is itself written in the resume text. If the resume just says "RAG",
-  output "RAG" — do not guess what it stands for.
-- "email" and "phone" must be copied exactly as written (usually in the header/contact section).
-  Never construct or guess an email/phone from a name.
-- "linkedin_url"/"github_url"/"portfolio_url": copy the URL as written if present (add "https://"
-  only if the resume shows a bare domain like "linkedin.com/in/x" with no scheme). Use null if
-  that platform isn't mentioned — do not assume a candidate has a GitHub/portfolio just because
-  they're technical.
-- "years_of_experience" should be your best numeric estimate based only on dates/durations
-  explicitly stated in the resume; use null if it cannot be determined."""
+# Kept deliberately short. Measured live against claude-sonnet-5: the original ~15-line version
+# of these rules (same content, more verbose) made extraction unreliable — 0/9 and 0/15 in two
+# separate batches came back completely empty (genuinely null, or wrapped in an unrequested
+# extra key) despite the input resume text being fine. This condensed version, same substance,
+# ran 5/5 clean on the same resume. Don't re-expand this without re-testing reliability — the
+# failure mode is silent (no exception, just an empty-but-"valid" result) and easy to miss.
+_EXTRACTION_BACKSTORY = (
+    "Extract only information explicitly present in the resume text — never invent, infer, or "
+    "embellish skills, experience, education, qualifiers, or dates. Use null (or an empty list) "
+    "for anything not present. Only include a degree that literally appears in the resume — "
+    "never add a second or higher degree the skills merely suggest. Never expand an abbreviation "
+    "(e.g. \"RAG\", \"NLP\") beyond what the resume itself writes. Copy email/phone/URLs exactly "
+    "as written; add \"https://\" to a bare domain but don't invent a URL that isn't present. "
+    "Estimate years_of_experience only from dates/durations actually stated."
+)
+
+
+# Claude occasionally still returns a genuinely/wrongly empty profile despite good input (either
+# all-null, or wrapped in an unrequested extra key) — root-caused to _EXTRACTION_BACKSTORY's
+# length (see its comment); the condensed version measured 5/5 clean. Kept as cheap insurance
+# against whatever residual rate remains, not as the primary fix.
+_MAX_EMPTY_PROFILE_RETRIES = 3
+
+
+def _looks_suspiciously_empty(profile: dict, resume_text: str) -> bool:
+    """True if resume_text has real content but nothing meaningful was extracted — the
+    signature of the wrapper-mismatch failure, not a genuinely sparse resume (a resume with
+    literally no name, skills, experience, or education is implausible for real input)."""
+    if len(resume_text.strip()) < 100:
+        return False
+    return not (
+        profile.get("name")
+        or profile.get("skills")
+        or profile.get("experience")
+        or profile.get("internships")
+        or profile.get("education")
+        or profile.get("projects")
+    )
 
 
 def extract_candidate_profile(resume_text: str) -> dict:
     """Calls the configured LLM provider to turn raw resume text into a structured profile dict."""
-    result = run_structured_task(
-        role="Resume Data Extraction Specialist",
-        goal="Extract structured candidate data from resume text with zero fabrication.",
-        backstory=_EXTRACTION_BACKSTORY,
-        task_description=f"Resume text:\n\n{resume_text}",
-        expected_output="A complete candidate profile matching the required schema exactly, "
-        "with null/empty values for anything not explicitly present in the resume text.",
-        output_model=CandidateProfile,
-        inputs={"resume_text": resume_text},
-    )
-    return result.model_dump()
+    profile: dict = {}
+    for attempt in range(1, _MAX_EMPTY_PROFILE_RETRIES + 1):
+        result = run_structured_task(
+            role="Resume Data Extraction Specialist",
+            goal="Extract structured candidate data from resume text with zero fabrication.",
+            backstory=_EXTRACTION_BACKSTORY,
+            task_description=f"Resume text:\n\n{resume_text}",
+            # The attempt-number suffix varies the prompt slightly on each retry (outside the
+            # resume_text block, so it can't be mistaken for resume content) — cheap insurance
+            # against Anthropic's prompt cache making retries less independent than intended.
+            expected_output=f"A complete candidate profile matching the required schema exactly, "
+            f"with null/empty values for anything not explicitly present in the resume text. "
+            f"(extraction pass {attempt})",
+            output_model=CandidateProfile,
+            inputs={"resume_text": resume_text},
+        )
+        profile = result.model_dump()
+        if not _looks_suspiciously_empty(profile, resume_text):
+            return profile
+        logger.warning(
+            "Resume extraction came back empty for non-trivial input (attempt %d/%d); retrying",
+            attempt, _MAX_EMPTY_PROFILE_RETRIES,
+        )
+    return profile
 
 
 # ============================================================================

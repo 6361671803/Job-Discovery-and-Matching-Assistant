@@ -16,6 +16,7 @@ Provider model-string format (verified live, not assumed from docs):
   Ollama:     "ollama/<model>"      — routed through CrewAI's LiteLLM integration, base_url only.
 """
 import itertools
+import json
 import logging
 import re
 import threading
@@ -164,6 +165,33 @@ def _run_with_llm(
                 raise LLMRequestError(f"LLM request failed after retries (rate limited): {e}") from e
             logger.info("Rate limited, retrying (attempt %d/%d)", attempt, MAX_RATE_LIMIT_RETRIES)
             time.sleep(_retry_delay_seconds(e, attempt))
+
+    # Claude (via CrewAI's Anthropic tool-use fallback path) was observed live wrapping its
+    # answer in an unrequested top-level key (e.g. {"profile": {...actual fields...}}) instead
+    # of returning the schema's fields directly. Since every field in these schemas has a
+    # default, that mismatch doesn't fail validation — CrewAI silently coerces it into an
+    # all-default, technically-valid-but-empty instance (result.pydantic), while result.json_dict
+    # stays None (not populated for this call shape) and result.raw holds the actual raw JSON
+    # string. Detect and unwrap that specific shape from result.raw before accepting an empty
+    # result: a single top-level key, not itself one of the schema's own fields, whose value is
+    # a dict that validates against the schema. Root cause fixed at the prompt level (see
+    # llm_client.py's _EXTRACTION_BACKSTORY comment) — this is a defense-in-depth safety net.
+    if result.pydantic is not None and not result.pydantic.model_dump(exclude_defaults=True):
+        try:
+            raw = json.loads(result.raw)
+        except (json.JSONDecodeError, TypeError):
+            raw = None
+        if isinstance(raw, dict) and len(raw) == 1:
+            (sole_key, sole_value), = raw.items()
+            if sole_key not in output_model.model_fields and isinstance(sole_value, dict):
+                try:
+                    unwrapped = output_model.model_validate(sole_value)
+                    logger.warning(
+                        "LLM wrapped its response in an unrequested '%s' key; unwrapped it", sole_key
+                    )
+                    return unwrapped
+                except Exception:  # noqa: BLE001 - not the wrapper shape, fall through
+                    pass
 
     if result.pydantic is None:
         raise LLMRequestError(
