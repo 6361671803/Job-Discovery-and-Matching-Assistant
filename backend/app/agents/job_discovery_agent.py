@@ -54,8 +54,15 @@ RENDER_CONCURRENCY = 4
 def _llm_concurrency() -> int:
     if settings.llm_provider == "gemini":
         return 2 if settings.gemini_api_key_2 else 1
-    # Non-Gemini providers aren't round-robined across keys here; a modest default lets browser
-    # rendering and LLM calls overlap without assuming a specific provider's rate limit.
+    if settings.llm_provider in ("anthropic", "openai"):
+        # Paid, single-key cloud APIs — real account rate limits, not a shared free pool.
+        # Checked live against this project's actual Anthropic account on 2026-10-07:
+        # 10,000 requests/min, 10M input + 2M output tokens/min — several orders of magnitude
+        # above what a single run needs (~150 calls total), so there's no real limit to protect
+        # here. Matches RENDER_CONCURRENCY since LLM calls can't outpace page rendering anyway.
+        return RENDER_CONCURRENCY
+    # Non-Gemini free-tier providers (e.g. openrouter) share a pool across all of OpenRouter's
+    # users, not just this account — stay conservative there.
     return 3
 
 

@@ -27,10 +27,6 @@ from app.services.resume_parser import SUPPORTED_EXTENSIONS, UnsupportedResumeFo
 from app.services.search_client import SearchNotConfiguredError, SearchRequestError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
-# NeMo Guardrails logs every internal event (including full page text) at INFO level — seen live
-# as 500+ log lines for a single safety check during Job Discovery, drowning out everything else
-# and making real failures hard to find. WARNING still surfaces actual problems.
-logging.getLogger("nemoguardrails").setLevel(logging.WARNING)
 
 app = FastAPI(title="Job Discovery & Matching Assistant API")
 
